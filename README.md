@@ -28,6 +28,7 @@ pip install -r requirements.txt
 ```
 
 **Llama Cpp installation**
+
 We use offline llama2 model to compare with OpenAI API. To use llama2 model, we need to install llama-cpp library.
 make sure you have CUDA environment ready
 ```bash
