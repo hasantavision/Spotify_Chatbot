@@ -8,3 +8,4 @@ tiktoken
 cohere
 openai
 gdown
+chromadb
