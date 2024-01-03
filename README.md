@@ -1,6 +1,7 @@
 # RAG Chatbot Streamlit App with Spotify Data
 
-
+[![RAG chatbot with OpenAI](https://github.com/hasantavision/Spotify_Chatbot/blob/master/assets/yt1.png)](https://www.youtube.com/watch?v=fL4f9hgiwPw "RAG chatbot with OpenAI")
+[![RAG chatbot with Llama2](https://github.com/hasantavision/Spotify_Chatbot/blob/master/assets/yt2.png)](https://www.youtube.com/watch?v=D-mgXB96r1o "RAG chatbot with Llama2")
 
 ## How to use this repo
 
@@ -27,6 +28,7 @@ pip install -r requirements.txt
 ```
 
 **Llama Cpp installation**
+
 We use offline llama2 model to compare with OpenAI API. To use llama2 model, we need to install llama-cpp library.
 make sure you have CUDA environment ready
 ```bash
