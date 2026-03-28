@@ -13,3 +13,5 @@ openai>=1.0.0
 gdown
 chromadb>=0.5.0
 llama-cpp-python
+rank_bm25
+lark

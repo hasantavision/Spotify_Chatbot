@@ -6,12 +6,16 @@ from urllib.request import urlretrieve
 
 from deepeval.metrics import AnswerRelevancyMetric, FaithfulnessMetric
 from deepeval.test_case import LLMTestCase
+from langchain.chains.query_constructor.base import AttributeInfo
+from langchain.retrievers import EnsembleRetriever
+from langchain.retrievers.self_query.base import SelfQueryRetriever
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.llms import LlamaCpp
+from langchain_community.retrievers import BM25Retriever
 from langchain_community.vectorstores import Chroma
+from langchain_core.documents import Document
 from langchain_core.language_models import BaseChatModel
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
-from langchain.retrievers.multi_query import MultiQueryRetriever
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,8 +24,6 @@ logger = logging.getLogger(__name__)
 # Embeddings & Vector Store
 # ---------------------------------------------------------------------------
 
-# BAAI/bge-base-en-v1.5 is a top-ranked model on the MTEB benchmark.
-# normalize_embeddings=True ensures unit vectors for cosine similarity.
 # Must match the model used in data_processing.py.
 embeddings = HuggingFaceEmbeddings(
     model_name="BAAI/bge-base-en-v1.5",
@@ -34,10 +36,33 @@ vector_db = Chroma(
 )
 
 # ---------------------------------------------------------------------------
+# Metadata schema for SelfQueryRetriever
+# Field names must match what data_processing.py stores in Chroma metadata.
+# ---------------------------------------------------------------------------
+
+_METADATA_FIELDS = [
+    AttributeInfo(
+        name="rating",
+        description="Star rating the user gave Spotify, integer from 1 (worst) to 5 (best)",
+        type="integer",
+    ),
+    AttributeInfo(
+        name="date",
+        description="Date the review was written, in YYYY-MM-DD format",
+        type="string",
+    ),
+    AttributeInfo(
+        name="app_version",
+        description="The Spotify app version that was being reviewed",
+        type="string",
+    ),
+]
+_DOC_DESCRIPTION = "A Spotify app review from the Google Play Store"
+
+# ---------------------------------------------------------------------------
 # Prompt templates
 # ---------------------------------------------------------------------------
 
-# Chat prompt for OpenAI (supports structured system/human turns)
 _SYSTEM_PROMPT = """You are an expert analyst of Spotify app reviews from the Google Play Store. \
 Your role is to help top management understand user feedback based solely on the provided review data.
 
@@ -57,7 +82,6 @@ QA_CHAT_PROMPT = ChatPromptTemplate.from_messages(
     ]
 )
 
-# Plain-text prompt for LlamaCpp (completion-style LLM)
 _LLAMA_TEMPLATE = """\
 You are analyzing Spotify app reviews from the Google Play Store.
 Answer management questions based only on the reviews provided.
@@ -88,10 +112,7 @@ def init_openai() -> Optional[BaseChatModel]:
     try:
         from langchain_openai import ChatOpenAI
 
-        _llm_openai = ChatOpenAI(
-            temperature=0,
-            model="gpt-4o-mini",  # cost-effective and more capable than gpt-4-1106-preview
-        )
+        _llm_openai = ChatOpenAI(temperature=0, model="gpt-4o-mini")
         _openai_initialized = True
         logger.info("OpenAI LLM initialised.")
         return _llm_openai
@@ -101,7 +122,6 @@ def init_openai() -> Optional[BaseChatModel]:
         return None
 
 
-# Download Llama 2 model if absent
 _LLAMA_MODEL_PATH = "llms/llama-2-7b-chat.Q4_0.gguf"
 if not os.path.isfile(_LLAMA_MODEL_PATH):
     logger.info("Downloading Llama 2 model…")
@@ -124,29 +144,65 @@ llm_llama = LlamaCpp(
 )
 
 # ---------------------------------------------------------------------------
-# Retriever helpers
+# Retriever
 # ---------------------------------------------------------------------------
 
 
-def _build_retriever(llm=None):
-    """
-    MMR (Maximal Marginal Relevance) retrieval balances relevance and diversity,
-    reducing the redundancy that pure similarity search produces.
+def _load_all_docs_from_chroma() -> List[Document]:
+    """Pull every document out of Chroma to build the BM25 index."""
+    data = vector_db.get()
+    if not data.get("documents"):
+        return []
+    return [
+        Document(page_content=content, metadata=meta or {})
+        for content, meta in zip(data["documents"], data["metadatas"])
+    ]
 
-    fetch_k=20 gives MMR a wide candidate pool to select the final k=6 docs from.
-    lambda_mult=0.7 biases slightly toward relevance over diversity.
 
-    When an OpenAI LLM is supplied, MultiQueryRetriever wraps the base retriever:
-    it generates several rephrased queries and merges the results, significantly
-    improving recall for ambiguous or multi-faceted questions.
+def _build_retriever(llm=None) -> EnsembleRetriever:
     """
-    base = vector_db.as_retriever(
+    Hybrid retriever: dense vector search + sparse BM25 keyword search,
+    fused via Reciprocal Rank Fusion (RRF).
+
+    BM25 catches exact keyword matches ("shuffle bug", "login crash") that
+    semantic embeddings may rank poorly. Vector search catches paraphrases
+    and semantic meaning. Together they give substantially better recall than
+    either alone.
+
+    For OpenAI: the vector component is replaced by SelfQueryRetriever, which
+    uses the LLM to extract structured metadata filters from the user's question
+    before running the vector search:
+        "1-star reviews"         → filter: rating == 1
+        "complaints in 2023"     → filter: date >= 2023-01-01
+        "issues on version 8.7"  → filter: app_version == "8.7"
+    This makes retrieval time-aware and rating-aware without any hard-coded logic.
+
+    For LlamaCpp: plain MMR vector search (diverse, reduces redundancy) is used
+    because SelfQueryRetriever requires a chat-capable LLM to parse filters.
+    """
+    bm25 = BM25Retriever.from_documents(_load_all_docs_from_chroma(), k=6)
+
+    if llm is not None and isinstance(llm, BaseChatModel):
+        self_query = SelfQueryRetriever.from_llm(
+            llm=llm,
+            vectorstore=vector_db,
+            document_contents=_DOC_DESCRIPTION,
+            metadata_field_info=_METADATA_FIELDS,
+            verbose=False,
+        )
+        return EnsembleRetriever(
+            retrievers=[self_query, bm25],
+            weights=[0.7, 0.3],
+        )
+
+    mmr = vector_db.as_retriever(
         search_type="mmr",
         search_kwargs={"k": 6, "fetch_k": 20, "lambda_mult": 0.7},
     )
-    if llm is not None and isinstance(llm, BaseChatModel):
-        return MultiQueryRetriever.from_llm(retriever=base, llm=llm)
-    return base
+    return EnsembleRetriever(
+        retrievers=[mmr, bm25],
+        weights=[0.6, 0.4],
+    )
 
 
 def _format_docs(docs) -> str:
@@ -157,7 +213,7 @@ def _format_history(chat_history: List[Tuple[str, str]]) -> str:
     if not chat_history:
         return ""
     lines = ["Previous conversation:"]
-    for human, ai in chat_history[-3:]:  # cap at last 3 turns to stay within context
+    for human, ai in chat_history[-3:]:
         lines.append(f"User: {human}\nAssistant: {ai}")
     return "\n".join(lines) + "\n\n"
 
@@ -232,7 +288,7 @@ def eval_func(
     question: str, answer: str, retrieval_context: List[str]
 ) -> List[Tuple[str, float, str]]:
     """
-    Evaluate the RAG output with multiple DeepEval metrics.
+    Evaluate RAG output with multiple DeepEval metrics.
 
     Returns:
         List of (metric_name, score, reason) tuples.
