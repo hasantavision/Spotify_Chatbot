@@ -12,6 +12,7 @@ from langchain_community.vectorstores import Chroma
 from langchain_core.language_models import BaseChatModel
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 from langchain.retrievers.multi_query import MultiQueryRetriever
+from sentence_transformers import CrossEncoder
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -124,6 +125,36 @@ llm_llama = LlamaCpp(
 )
 
 # ---------------------------------------------------------------------------
+# Cross-encoder re-ranker
+# ---------------------------------------------------------------------------
+
+# ms-marco-MiniLM-L-6-v2 is a lightweight but accurate cross-encoder trained on
+# the MS MARCO passage-ranking dataset. It scores (query, passage) pairs directly,
+# unlike bi-encoders which compare independent embeddings.
+_cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+# Number of documents to keep after re-ranking (fed to the LLM as context)
+_RERANK_TOP_K = 6
+
+
+def _rerank_docs(query: str, docs, top_k: int = _RERANK_TOP_K):
+    """
+    Re-rank retrieved documents using a cross-encoder model.
+
+    The cross-encoder jointly encodes the query and each document, producing a
+    relevance score that is more accurate than cosine similarity between
+    independent embeddings. We retrieve a larger candidate pool (k=15) and then
+    select the top_k most relevant documents according to the cross-encoder.
+    """
+    if not docs:
+        return docs
+    pairs = [(query, doc.page_content) for doc in docs]
+    scores = _cross_encoder.predict(pairs)
+    ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
+    return [doc for _, doc in ranked[:top_k]]
+
+
+# ---------------------------------------------------------------------------
 # Retriever helpers
 # ---------------------------------------------------------------------------
 
@@ -133,8 +164,10 @@ def _build_retriever(llm=None):
     MMR (Maximal Marginal Relevance) retrieval balances relevance and diversity,
     reducing the redundancy that pure similarity search produces.
 
-    fetch_k=20 gives MMR a wide candidate pool to select the final k=6 docs from.
+    fetch_k=20 gives MMR a wide candidate pool to select the final k=15 docs from.
     lambda_mult=0.7 biases slightly toward relevance over diversity.
+    k=15 retrieves more candidates so the cross-encoder re-ranker can surface
+    the best 6 from a wider pool.
 
     When an OpenAI LLM is supplied, MultiQueryRetriever wraps the base retriever:
     it generates several rephrased queries and merges the results, significantly
@@ -142,7 +175,7 @@ def _build_retriever(llm=None):
     """
     base = vector_db.as_retriever(
         search_type="mmr",
-        search_kwargs={"k": 6, "fetch_k": 20, "lambda_mult": 0.7},
+        search_kwargs={"k": 15, "fetch_k": 30, "lambda_mult": 0.7},
     )
     if llm is not None and isinstance(llm, BaseChatModel):
         return MultiQueryRetriever.from_llm(retriever=base, llm=llm)
@@ -194,10 +227,11 @@ def rag_func(
 
     retriever = _build_retriever(llm if use_openai else None)
     docs = retriever.invoke(question)
+    logger.info("Retrieved %d document chunks before re-ranking.", len(docs))
+    docs = _rerank_docs(question, docs)
+    logger.info("Re-ranked to top %d document chunks.", len(docs))
     context_str = _format_docs(docs)
     history_section = _format_history(chat_history or [])
-
-    logger.info("Retrieved %d document chunks.", len(docs))
 
     if use_openai and isinstance(llm, BaseChatModel):
         messages = QA_CHAT_PROMPT.format_messages(
