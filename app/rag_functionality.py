@@ -128,10 +128,11 @@ llm_llama = LlamaCpp(
 # Cross-encoder re-ranker
 # ---------------------------------------------------------------------------
 
-# ms-marco-MiniLM-L-6-v2 is a lightweight but accurate cross-encoder trained on
-# the MS MARCO passage-ranking dataset. It scores (query, passage) pairs directly,
-# unlike bi-encoders which compare independent embeddings.
-_cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+# BAAI/bge-reranker-v2-m3 is a state-of-the-art open-source cross-encoder
+# (Apache 2.0) that supports 100+ languages and matches commercial rerankers
+# on GPU. It scores (query, passage) pairs directly, unlike bi-encoders which
+# compare independent embeddings.
+_cross_encoder = CrossEncoder("BAAI/bge-reranker-v2-m3")
 
 # Number of documents to keep after re-ranking (fed to the LLM as context)
 _RERANK_TOP_K = 6

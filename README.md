@@ -61,20 +61,16 @@ The current implementation uses **`cross-encoder/ms-marco-MiniLM-L-6-v2`** — a
 
 | Model | License | Multilingual | Notes |
 |---|---|---|---|
-| `cross-encoder/ms-marco-MiniLM-L-6-v2` *(current)* | Open | No | Fast, CPU-friendly, good baseline |
-| `BAAI/bge-reranker-v2-m3` | Apache 2.0 | Yes (100+) | State-of-the-art open-source; matches Cohere on GPU |
+| `cross-encoder/ms-marco-MiniLM-L-6-v2` | Open | No | Fast, CPU-friendly, good baseline |
+| `BAAI/bge-reranker-v2-m3` *(current)* | Apache 2.0 | Yes (100+) | State-of-the-art open-source; matches Cohere on GPU |
 | `Cohere Rerank 4 Pro` | Proprietary API | Yes (100+) | Highest ELO (1627); best for production/finance |
 | `ZeroEntropy zerank-2` | Non-commercial | Yes (100+) | Calibrated scores; no threshold tuning needed |
 | `Jina Reranker v2` | Apache 2.0 | Yes | Strong multilingual + agentic RAG support |
 
-**To swap in `bge-reranker-v2-m3`** (recommended open-source upgrade), change one line in `app/rag_functionality.py`:
+**To revert to the lighter CPU-friendly model**, change one line in `app/rag_functionality.py`:
 
 ```python
-# Before
 _cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-
-# After
-_cross_encoder = CrossEncoder("BAAI/bge-reranker-v2-m3")
 ```
 
 ---
