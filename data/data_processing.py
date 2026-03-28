@@ -8,6 +8,12 @@ from langchain_community.document_loaders import CSVLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from tqdm import tqdm
 
+# Maximum characters for a single review document before it is split.
+# Play Store reviews are almost always well under this limit, so in practice
+# every review remains one atomic chunk — preserving its full semantic context.
+# Only unusually long reviews (e.g. copy-pasted essays) get split.
+MAX_REVIEW_CHARS = 1500
+
 CHROMA_PERSIST_DIR = "data/chroma_db"
 REVIEWS_RAW = "SPOTIFY_REVIEWS.csv"
 REVIEWS_CLEANED = "SPOTIFY_REVIEWS_CLEANED.csv"
@@ -23,13 +29,22 @@ df.to_csv(REVIEWS_CLEANED, index=False)
 print("Loading data...")
 loader = CSVLoader(file_path=REVIEWS_CLEANED)
 data = loader.load()
-print(f"Loaded {len(data)} documents")
+print(f"Loaded {len(data)} reviews")
 
-# Best practice: smaller chunks (512 tokens) with meaningful overlap (20%)
-# improves retrieval precision — large chunks hurt both recall and context quality
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=100)
+# Each document in `data` is already one complete review (one CSV row).
+# We embed each review as a single chunk so retrieval returns whole, coherent
+# reviews rather than fragments that may lose sentiment or context mid-sentence.
+# The splitter is applied only as a safety net for outlier reviews that exceed
+# MAX_REVIEW_CHARS; overlap is irrelevant for those rare cases but set
+# conservatively to avoid mid-word cuts.
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=MAX_REVIEW_CHARS,
+    chunk_overlap=0,
+    separators=["\n\n", "\n", ". ", " ", ""],  # prefer sentence boundaries
+)
 docs = text_splitter.split_documents(data)
-print(f"Split into {len(docs)} chunks")
+split_count = len(docs) - len(data)
+print(f"{len(docs)} chunks total ({split_count} extra from oversized reviews)")
 
 # BAAI/bge-base-en-v1.5 consistently ranks at the top of MTEB benchmarks;
 # normalize_embeddings=True enables cosine similarity comparisons
