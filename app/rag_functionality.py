@@ -1,117 +1,252 @@
-import os.path
+import logging
+import os
 import shutil
-from typing import List, Any
-
-from deepeval.test_case import LLMTestCase
-from langchain.chains import RetrievalQA
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.llms.llamacpp import LlamaCpp
-from langchain_community.vectorstores.chroma import Chroma
+from typing import Any, List, Optional, Tuple
 from urllib.request import urlretrieve
-from langchain_core.prompts import PromptTemplate
-from deepeval.metrics.answer_relevancy import AnswerRelevancyMetric
-from deepeval.models.gpt_model import ChatOpenAI
 
-metric = AnswerRelevancyMetric(minimum_score=0.5,
-                               model="gpt-4-1106-preview",
-                               include_reason=True
-                               )
+from deepeval.metrics import AnswerRelevancyMetric, FaithfulnessMetric
+from deepeval.test_case import LLMTestCase
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.llms import LlamaCpp
+from langchain_community.vectorstores import Chroma
+from langchain_core.language_models import BaseChatModel
+from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
+from langchain.retrievers.multi_query import MultiQueryRetriever
 
-# for easier demo, I use default model of HuggingFaceEmbeddings.
-# You can try with Instruct embedding but the processing time will be longer
-# embedding model is the most important aspect in creating RAG to retrieve the data
-embeddings = HuggingFaceEmbeddings()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# for the demo purpose, I use Chroma, you can try it without the need to set up database
-# I actually use milvus for development to be able to develop anywhere
-vector_db = Chroma(persist_directory="data/chroma_db", embedding_function=embeddings)
+# ---------------------------------------------------------------------------
+# Embeddings & Vector Store
+# ---------------------------------------------------------------------------
+
+# BAAI/bge-base-en-v1.5 is a top-ranked model on the MTEB benchmark.
+# normalize_embeddings=True ensures unit vectors for cosine similarity.
+# Must match the model used in data_processing.py.
+embeddings = HuggingFaceEmbeddings(
+    model_name="BAAI/bge-base-en-v1.5",
+    encode_kwargs={"normalize_embeddings": True},
+)
+
+vector_db = Chroma(
+    persist_directory="data/chroma_db",
+    embedding_function=embeddings,
+)
+
+# ---------------------------------------------------------------------------
+# Prompt templates
+# ---------------------------------------------------------------------------
+
+# Chat prompt for OpenAI (supports structured system/human turns)
+_SYSTEM_PROMPT = """You are an expert analyst of Spotify app reviews from the Google Play Store. \
+Your role is to help top management understand user feedback based solely on the provided review data.
+
+Guidelines:
+- Answer only based on the context provided below; do not make up information.
+- If the context is insufficient, say so clearly.
+- Provide structured, evidence-backed answers with key themes and patterns.
+- Politely decline questions unrelated to Spotify reviews.
+{history_section}
+Context from reviews:
+{context}"""
+
+QA_CHAT_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        ("system", _SYSTEM_PROMPT),
+        ("human", "{question}"),
+    ]
+)
+
+# Plain-text prompt for LlamaCpp (completion-style LLM)
+_LLAMA_TEMPLATE = """\
+You are analyzing Spotify app reviews from the Google Play Store.
+Answer management questions based only on the reviews provided.
+If you don't know the answer or the question is unrelated, say so politely.
+{history_section}
+Context:
+{context}
+
+Question: {question}
+Answer:"""
+
+QA_LLAMA_PROMPT = PromptTemplate(
+    template=_LLAMA_TEMPLATE,
+    input_variables=["context", "question", "history_section"],
+)
+
+# ---------------------------------------------------------------------------
+# LLM initialisation
+# ---------------------------------------------------------------------------
+
+_llm_openai: Optional[BaseChatModel] = None
+_openai_initialized: bool = False
 
 
-# This is a template used for every prompt, you can change this based on your own use case
-template = """You are analyzing spotify app reviews from google play store to be used to answer top management's questions based on the reviews' summary.
-If you don't know the answer or the question is not related to this task, answer it politely, don't try to make up an answer. 
-answer only the points asked.
-    {context}
-    Question: {question}
-    Helpful Answer:"""
-QA_CHAIN_PROMPT = PromptTemplate.from_template(template)
-
-# global variable to check some states
-openai_initialized = False
-llm_openai = None
-
-
-# this function used if you have filled openapi key in streamlit app
-def init_openai():
-    global openai_initialized
+def init_openai() -> Optional[BaseChatModel]:
+    """Lazy-initialise ChatOpenAI. Returns None on failure."""
+    global _llm_openai, _openai_initialized
     try:
-        openai = ChatOpenAI(
+        from langchain_openai import ChatOpenAI
+
+        _llm_openai = ChatOpenAI(
             temperature=0,
-            model="gpt-4-1106-preview"
+            model="gpt-4o-mini",  # cost-effective and more capable than gpt-4-1106-preview
         )
-        openai_initialized = True
-        return openai
-    except Exception:
-        openai_initialized = False
+        _openai_initialized = True
+        logger.info("OpenAI LLM initialised.")
+        return _llm_openai
+    except Exception as exc:
+        logger.error("Failed to initialise OpenAI: %s", exc)
+        _openai_initialized = False
+        return None
 
 
-# change the model path if you save the downloaded model elsewhere
-model_path = "llms/llama-2-7b-chat.Q4_0.gguf"
-if not os.path.isfile(model_path):
-    url = "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q4_0.gguf?download=true"
-    filename = "llama-2-7b-chat.Q4_0.gguf"
-    urlretrieve(url, filename)
-    shutil.move(filename, model_path)
+# Download Llama 2 model if absent
+_LLAMA_MODEL_PATH = "llms/llama-2-7b-chat.Q4_0.gguf"
+if not os.path.isfile(_LLAMA_MODEL_PATH):
+    logger.info("Downloading Llama 2 model…")
+    _url = (
+        "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF"
+        "/resolve/main/llama-2-7b-chat.Q4_0.gguf?download=true"
+    )
+    _tmp = "llama-2-7b-chat.Q4_0.gguf"
+    urlretrieve(_url, _tmp)
+    shutil.move(_tmp, _LLAMA_MODEL_PATH)
 
-# by default this model is loaded when the app start, I assume not everyone has openai key,
-# so I prioritize the offline model
 llm_llama = LlamaCpp(
-    model_path=model_path,
+    model_path=_LLAMA_MODEL_PATH,
     n_gpu_layers=33,
     n_batch=512,
     temperature=0.0,
     top_p=1,
-    n_ctx=6000
+    n_ctx=6000,
+    verbose=False,
 )
 
+# ---------------------------------------------------------------------------
+# Retriever helpers
+# ---------------------------------------------------------------------------
 
-# this is the main chain
-# the chain doesn't support time-aware RAG.
-# I tried to use timescale vector, but due to limited time, I keep using Milvus and Chroma
-def load_chain(llm):
-    qa_chain = RetrievalQA.from_chain_type(
-        llm,
-        retriever=vector_db.as_retriever(
-            search_kwargs={"k": 10}
-        ),
-        return_source_documents=True,  # used for evaluation
-        chain_type_kwargs={"prompt": QA_CHAIN_PROMPT}
+
+def _build_retriever(llm=None):
+    """
+    MMR (Maximal Marginal Relevance) retrieval balances relevance and diversity,
+    reducing the redundancy that pure similarity search produces.
+
+    fetch_k=20 gives MMR a wide candidate pool to select the final k=6 docs from.
+    lambda_mult=0.7 biases slightly toward relevance over diversity.
+
+    When an OpenAI LLM is supplied, MultiQueryRetriever wraps the base retriever:
+    it generates several rephrased queries and merges the results, significantly
+    improving recall for ambiguous or multi-faceted questions.
+    """
+    base = vector_db.as_retriever(
+        search_type="mmr",
+        search_kwargs={"k": 6, "fetch_k": 20, "lambda_mult": 0.7},
     )
-    return qa_chain
+    if llm is not None and isinstance(llm, BaseChatModel):
+        return MultiQueryRetriever.from_llm(retriever=base, llm=llm)
+    return base
 
 
-# this function is used for processing the question
-# it has options to use openai or llama2 depends on your choice in streamlit app
-def rag_func(question: str, use_openai: bool) -> dict[str, Any]:
-    global llm_openai
+def _format_docs(docs) -> str:
+    return "\n\n---\n\n".join(doc.page_content for doc in docs)
+
+
+def _format_history(chat_history: List[Tuple[str, str]]) -> str:
+    if not chat_history:
+        return ""
+    lines = ["Previous conversation:"]
+    for human, ai in chat_history[-3:]:  # cap at last 3 turns to stay within context
+        lines.append(f"User: {human}\nAssistant: {ai}")
+    return "\n".join(lines) + "\n\n"
+
+
+# ---------------------------------------------------------------------------
+# Core RAG function
+# ---------------------------------------------------------------------------
+
+
+def rag_func(
+    question: str,
+    use_openai: bool,
+    chat_history: Optional[List[Tuple[str, str]]] = None,
+) -> dict[str, Any]:
+    """
+    Execute a RAG query.
+
+    Args:
+        question:     The user's question.
+        use_openai:   Use ChatOpenAI when True, LlamaCpp when False.
+        chat_history: Optional list of (user_msg, assistant_msg) pairs.
+
+    Returns:
+        {"answer": str, "context": List[Document]}
+    """
+    global _llm_openai
+
     if use_openai:
-        if not openai_initialized:
-            llm_openai = init_openai()
-        qa_chain = load_chain(llm_openai)
+        if not _openai_initialized:
+            _llm_openai = init_openai()
+        llm = _llm_openai
     else:
-        qa_chain = load_chain(llm_llama)
-    result = qa_chain({"query": question})
-    print([doc.page_content for doc in result['source_documents']])
-    return result
+        llm = llm_llama
+
+    retriever = _build_retriever(llm if use_openai else None)
+    docs = retriever.invoke(question)
+    context_str = _format_docs(docs)
+    history_section = _format_history(chat_history or [])
+
+    logger.info("Retrieved %d document chunks.", len(docs))
+
+    if use_openai and isinstance(llm, BaseChatModel):
+        messages = QA_CHAT_PROMPT.format_messages(
+            context=context_str,
+            question=question,
+            history_section=history_section,
+        )
+        response = llm.invoke(messages)
+        answer = response.content
+    else:
+        prompt_str = QA_LLAMA_PROMPT.format(
+            context=context_str,
+            question=question,
+            history_section=history_section,
+        )
+        answer = llm.invoke(prompt_str)
+
+    return {"answer": answer, "context": docs}
 
 
-# used for evaluation, this evaluation use openai as the llm, need openai api key
-# you can disable this in streamlit app
-def eval_func(question: str, result, retrieval_context: List[str]):
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
+_eval_metrics = [
+    AnswerRelevancyMetric(minimum_score=0.5, model="gpt-4o-mini", include_reason=True),
+    FaithfulnessMetric(minimum_score=0.5, model="gpt-4o-mini", include_reason=True),
+]
+
+
+def eval_func(
+    question: str, answer: str, retrieval_context: List[str]
+) -> List[Tuple[str, float, str]]:
+    """
+    Evaluate the RAG output with multiple DeepEval metrics.
+
+    Returns:
+        List of (metric_name, score, reason) tuples.
+    """
     test_case = LLMTestCase(
         input=question,
-        actual_output=result,
-        retrieval_context=retrieval_context
+        actual_output=answer,
+        retrieval_context=retrieval_context,
     )
-    metric.measure(test_case)
-    return metric.score, metric.reason
+    results = []
+    for metric in _eval_metrics:
+        try:
+            metric.measure(test_case)
+            results.append((type(metric).__name__, metric.score, metric.reason))
+        except Exception as exc:
+            logger.error("Metric %s failed: %s", type(metric).__name__, exc)
+    return results
